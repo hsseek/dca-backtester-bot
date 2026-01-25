@@ -5,7 +5,7 @@ import os
 import logging
 import time
 from collections import deque
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Deque, List, Optional, Set
 
 import pandas as pd
@@ -39,14 +39,6 @@ def _get_env_required(name: str) -> str:
     return v
 
 
-def _parse_allowed_chat_ids(s: str) -> Set[int]:
-    out: Set[int] = set()
-    for part in s.split(","):
-        part = part.strip()
-        if not part:
-            continue
-        out.add(int(part))
-    return out
 
 
 def _to_bool(s: str) -> bool:
@@ -58,15 +50,9 @@ def _to_bool(s: str) -> bool:
     raise ValueError(f"Invalid boolean value: '{s}'")
 
 
-def _get_oldest_yf_date(ticker: str = "SPY") -> str:
-    """Fetches the oldest available date for a given ticker from Yahoo Finance."""
-    try:
-        hist = yf.Ticker(ticker).history(period="max", auto_adjust=False)
-        if not hist.empty:
-            return hist.index[0].strftime("%Y-%m-%d")
-    except Exception as e:
-        logger.error(f"Could not fetch oldest date for {ticker}: {e}")
-    return "1993-01-29" # Fallback to SPY's known start date
+def _get_intraday_start_date() -> str:
+    """Calculates the recommended start date for intraday backtests (60 days ago)."""
+    return (datetime.now() - timedelta(days=60)).strftime("%Y-%m-%d")
 
 
 # -------------------------
@@ -95,14 +81,6 @@ def fetch_intraday(ticker: str, start: str, end: str, interval: str) -> pd.DataF
 # -------------------------
 # Telegram helpers
 # -------------------------
-def _ensure_allowed(update: Update, allowed_ids: Set[int]) -> bool:
-    chat_id = update.effective_chat.id
-    if not chat_id or chat_id not in allowed_ids:
-        logger.warning(f"Rejected access from chat_id={chat_id}")
-        return False
-    return True
-
-
 def _chunk_text(s: str, limit: int = 4000) -> List[str]:
     chunks: List[str] = []
     buf = ""
@@ -129,13 +107,10 @@ def _format_result_md(res: BacktestResult) -> str:
         f"*Total cost:* ${res.total_cost_usd:,.2f}",
         "",
         "✅ *SOLD triggered*",
-        f"*Sell time:* {res.sell_dt_et}",
+        f"*Sell time:* {res.sell_dt_et} ({res.days_to_sell} days)",
         f"*Sell price:* ${res.sell_price:,.2f}",
-        f"*Days to sell:* {res.days_to_sell} days",
-        f"*Proceeds:* ${res.proceeds_usd:,.2f}",
-        f"*Profit:* ${res.profit_usd:,.2f} ({res.profit_pct_on_cost*100:.2f}%)",
-        f"*Proceeds (KRW):* ₩{res.proceeds_krw:,.0f}",
-        f"*Profit (KRW):* ₩{res.profit_krw:,.0f}",
+        f"*Proceeds:* ${res.proceeds_usd:,.2f} (₩{res.proceeds_krw:,.0f})",
+        f"*Profit({res.profit_pct_on_cost*100:.2f}%):* ${res.profit_usd:,.2f} (₩{res.profit_krw:,.0f})",
     ]
     return "\n".join(lines)
 
@@ -144,42 +119,61 @@ def _format_result_md(res: BacktestResult) -> str:
 # Command handlers
 # -------------------------
 async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not _ensure_allowed(update, context.bot_data["allowed_chat_ids"]):
-        return
-
-    oldest_date = context.bot_data.get("oldest_yf_date", "1993-01-29")
+    # Use the intraday_start_date from bot_data
+    intraday_start_date = context.bot_data.get("intraday_start_date", "YYYY-MM-DD")
     msg = (
         "DCA Backtester Bot is running.\n\n"
         "Use /ping to check status and defaults.\n"
         "Use /backtest to run a simulation.\n\n"
         "*Example:*\n"
-        f"`/backtest QQQ {oldest_date} 500 true`"
+        f"`/backtest TQQQ {intraday_start_date} 500`"
     )
-    await update.message.reply_text(msg, parse_mode=ParseMode.MARKDOWN)
+    await update.effective_message.reply_text(msg, parse_mode=ParseMode.MARKDOWN)
 
 
 async def ping_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     chat_id = update.effective_chat.id
-    is_allowed = _ensure_allowed(update, context.bot_data["allowed_chat_ids"])
 
     defaults = context.bot_data["defaults"]
     lines = [
         "*Bot Status:* ONLINE",
         f"*Chat ID:* {chat_id}",
-        f"*Authorized:* {'YES' if is_allowed else 'NO'}",
         "",
         "*Current Defaults:*",
         f"  Sell Ratio = {defaults['sell_r']}",
         f"  FX Rate = {defaults['fx']}",
         f"  Intraday Interval = {defaults['interval']}",
     ]
-    await update.message.reply_text("\n".join(lines), parse_mode=ParseMode.MARKDOWN)
+    await update.effective_message.reply_text("\n".join(lines), parse_mode=ParseMode.MARKDOWN)
+
+
+async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    intraday_start_date = context.bot_data.get("intraday_start_date", "YYYY-MM-DD")
+    
+    help_message = (
+        "Hello! I am a DCA Backtesting Bot.\n\n"
+        "*Available Commands:*\n"
+        "  /start - Get a welcome message and basic bot information.\n"
+        "  /help - Display this help message.\n"
+        "  /ping - Check bot status and current default settings.\n"
+        "  /backtest - Run a backtest simulation.\n\n"
+        "*Usage for /backtest:*\n"
+        "  */backtest <TICKER> <YYYY-MM-DD> <DAILY_BUDGET> [prefer_avg_buy] [sell_r] [fx] [interval]*\n\n"
+        "*Arguments:*\n"
+        "  *<TICKER>*: Stock ticker symbol (e.g., QQQ, SPY).\n"
+        "  *<YYYY-MM-DD>*: Start date for the backtest (e.g., 2023-01-01).\n"
+        "  *<DAILY_BUDGET>*: Daily budget in USD for purchases (e.g., 500).\n"
+        "  *[prefer_avg_buy]*: Optional. *true* or *false*. Default is *true*.\n"
+        "  *[sell_r]*: Optional. Sell target ratio (e.g., 0.10 for 10%). Default from config.\n"
+        "  *[fx]*: Optional. FX rate KRW per USD (e.g., 1450). Default from config.\n"
+        "  *[interval]*: Optional. Intraday interval (e.g., 5m, 15m). Default from config.\n\n"
+        f"*Example:*\n"
+        f"`/backtest TQQQ {intraday_start_date} 500`\n\n"
+    )
+    await update.effective_message.reply_text(help_message, parse_mode=ParseMode.MARKDOWN)
 
 
 async def backtest_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not _ensure_allowed(update, context.bot_data["allowed_chat_ids"]):
-        return
-
     args = context.args
     defaults = context.bot_data["defaults"]
     log_history: Deque[str] = deque(maxlen=20)
@@ -187,8 +181,8 @@ async def backtest_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     # --- 1. Immediate ACK and Argument Parsing ---
     try:
         if len(args) < 3:
-            await update.message.reply_text(
-                "Usage: `/backtest <TICKER> <YYYY-MM-DD> <DAILY_BUDGET> [prefer_avg_buy] [sell_r] [fx] [interval]`",
+            await update.effective_message.reply_text(
+                "Usage: */backtest <TICKER> <YYYY-MM-DD> <DAILY_BUDGET> [prefer_avg_buy] [sell_r] [fx] [interval]*",
                 parse_mode=ParseMode.MARKDOWN
             )
             return
@@ -216,10 +210,10 @@ async def backtest_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
             f"  Sell Target: {sell_r}\n\n"
             "Process starting now. A summary will be sent on completion, or an error if it fails."
         )
-        await update.message.reply_text(ack_msg, parse_mode=ParseMode.MARKDOWN)
+        await update.effective_message.reply_text(ack_msg, parse_mode=ParseMode.MARKDOWN)
 
     except (ValueError, IndexError) as e:
-        await update.message.reply_text(f"❌ *Argument Error:*\n{e}\nPlease check your inputs.", parse_mode=ParseMode.MARKDOWN)
+        await update.effective_message.reply_text(f"❌ *Argument Error:*\n{e}\nPlease check your inputs.", parse_mode=ParseMode.MARKDOWN)
         return
 
     # --- 2. Setup File-based Logging ---
@@ -230,11 +224,12 @@ async def backtest_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     try:
         log_dir = "logs"
         os.makedirs(log_dir, exist_ok=True)
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        log_file = os.path.join(log_dir, f"{ticker}_{timestamp}.log")
+        # Use one log file per day
+        log_file = os.path.join(log_dir, f"{datetime.now().strftime('%Y-%m-%d')}.log")
 
-        file_handler = logging.FileHandler(log_file, mode='w')
-        file_handler.setFormatter(logging.Formatter("[%(asctime)s] %(message)s"))
+        # Append to the daily log file
+        file_handler = logging.FileHandler(log_file, mode='a')
+        file_handler.setFormatter(logging.Formatter("[%(asctime)s] [%(name)s] %(message)s"))
         run_logger.addHandler(file_handler)
         run_logger.setLevel(logging.INFO)
 
@@ -243,7 +238,7 @@ async def backtest_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
             log_history.append(msg)
 
         # --- 3. Run Backtest in Thread ---
-        log_to_file_and_history("[BOT] Handler invoked, offloading to background thread.")
+        log_to_file_and_history(f"--- Starting backtest for {ticker} from chat {update.effective_chat.id} ---")
 
         result: BacktestResult = await asyncio.to_thread(
             run_backtest,
@@ -253,13 +248,13 @@ async def backtest_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
             log=log_to_file_and_history,
         )
 
-        log_to_file_and_history(f"[BOT] Backtest finished. Log file: {log_file}")
+        log_to_file_and_history(f"[BOT] Backtest for {ticker} finished successfully.")
         summary_md = _format_result_md(result)
-        await update.message.reply_text(summary_md, parse_mode=ParseMode.MARKDOWN)
+        await update.effective_message.reply_text(summary_md, parse_mode=ParseMode.MARKDOWN)
 
     except Exception as e:
-        logger.exception("Backtest failed in background thread")
-        log_to_file_and_history(f"[BOT] Backtest failed with exception: {e}")
+        logger.exception(f"Backtest for {ticker} failed in background thread")
+        log_to_file_and_history(f"[BOT] Backtest for {ticker} failed with exception: {e}")
         
         error_msg = (
             f"❌ *Backtest for {ticker} failed:*\n{type(e).__name__}: {e}\n\n"
@@ -269,11 +264,12 @@ async def backtest_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
             "```"
         )
         for chunk in _chunk_text(error_msg):
-            await update.message.reply_text(chunk, parse_mode=ParseMode.MARKDOWN)
+            await update.effective_message.reply_text(chunk, parse_mode=ParseMode.MARKDOWN)
 
     finally:
         # --- 4. Cleanup ---
         if file_handler:
+            log_to_file_and_history(f"--- Backtest for {ticker} complete ---")
             file_handler.close()
             run_logger.removeHandler(file_handler)
 
@@ -283,8 +279,6 @@ def main() -> None:
     logger.info("Env vars loaded from .env")
 
     token = _get_env_required("TELEGRAM_BOT_TOKEN")
-    allowed_ids_str = _get_env_required("TELEGRAM_ALLOWED_CHAT_IDS")
-    allowed = _parse_allowed_chat_ids(allowed_ids_str)
     
     defaults = {
         "fx": float(os.getenv("DEFAULT_FX", "1450.0")),
@@ -293,15 +287,16 @@ def main() -> None:
     }
 
     # Fetch oldest date for help message and store in bot_data
-    oldest_date = _get_oldest_yf_date()
-    logger.info(f"Fetched oldest available YF date: {oldest_date}")
+    intraday_start_date = _get_intraday_start_date()
+    logger.info(f"Calculated recommended intraday start date: {intraday_start_date}")
 
     app = Application.builder().token(token).build()
-    app.bot_data["allowed_chat_ids"] = allowed
+    # No longer setting allowed_chat_ids in bot_data
     app.bot_data["defaults"] = defaults
-    app.bot_data["oldest_yf_date"] = oldest_date
+    app.bot_data["intraday_start_date"] = intraday_start_date
 
     app.add_handler(CommandHandler("start", start_cmd))
+    app.add_handler(CommandHandler("help", help_cmd))
     app.add_handler(CommandHandler("ping", ping_cmd))
     app.add_handler(CommandHandler("backtest", backtest_cmd))
 
