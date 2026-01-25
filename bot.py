@@ -99,6 +99,10 @@ def _format_result_md(res: BacktestResult) -> str:
     if not res.sold:
         return "⚠️ *Sell target not reached within available history.*"
 
+    profit_pct_str = ""
+    if res.profit_pct_on_cost is not None:
+        profit_pct_str = f" ({res.profit_pct_on_cost*100:.2f}%)"
+
     lines = [
         f"*Ticker:* {res.ticker}",
         f"*First buy:* {res.first_buy_dt_et} @ ${res.first_buy_price:,.2f}",
@@ -110,14 +114,25 @@ def _format_result_md(res: BacktestResult) -> str:
         f"*Sell time:* {res.sell_dt_et} ({res.days_to_sell} days)",
         f"*Sell price:* ${res.sell_price:,.2f}",
         f"*Proceeds:* ${res.proceeds_usd:,.2f} (₩{res.proceeds_krw:,.0f})",
-        f"*Profit({res.profit_pct_on_cost*100:.2f}%):* ${res.profit_usd:,.2f} (₩{res.profit_krw:,.0f})",
+        f"*Profit{profit_pct_str}:* ${res.profit_usd:,.2f} (₩{res.profit_krw:,.0f})",
     ]
     return "\n".join(lines)
 
 
 # -------------------------
-# Command handlers
+# Command & Error handlers
 # -------------------------
+async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Log the error and send a telegram message to notify the user."""
+    logger.error("Exception while handling an update:", exc_info=context.error)
+
+    # Optionally, notify the user that an error occurred
+    if isinstance(update, Update) and update.effective_message:
+        await update.effective_message.reply_text(
+            "An unexpected error occurred. The developer has been notified."
+        )
+
+
 async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     # Use the intraday_start_date from bot_data
     intraday_start_date = context.bot_data.get("intraday_start_date", "YYYY-MM-DD")
@@ -173,24 +188,88 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.effective_message.reply_text(help_message, parse_mode=ParseMode.MARKDOWN)
 
 
+def sync_backtest_runner(params: BacktestParams, log_history: Deque[str], chat_id: int) -> BacktestResult:
+    """
+    Synchronous helper to run the backtest and handle file logging.
+    This function is intended to be run in a separate thread.
+    """
+    file_handler = None
+    # Use a unique logger name for each run to ensure thread safety with handlers
+    run_logger = logging.getLogger(f"run_{params.ticker}_{time.time_ns()}")
+    run_logger.propagate = False  # Prevent duplicate logs to stdout
+
+    try:
+        log_dir = "logs"
+        os.makedirs(log_dir, exist_ok=True)
+        log_file = os.path.join(log_dir, f"{datetime.now().strftime('%Y-%m-%d')}.log")
+
+        file_handler = logging.FileHandler(log_file, mode='a', encoding='utf-8')
+        file_handler.setFormatter(logging.Formatter("[%(asctime)s] [%(name)s] %(message)s"))
+        run_logger.addHandler(file_handler)
+        run_logger.setLevel(logging.INFO)
+
+        def log_to_file_and_history(msg: str):
+            run_logger.info(msg)
+            log_history.append(msg)
+
+        log_to_file_and_history(f"--- Starting backtest for {params.ticker} from chat {chat_id} ---")
+
+        result = run_backtest(
+            params=params,
+            fetch_daily=fetch_daily,
+            fetch_intraday=fetch_intraday,
+            log=log_to_file_and_history,
+        )
+
+        log_to_file_and_history(f"[BOT] Backtest for {params.ticker} finished successfully.")
+        return result
+
+    except Exception as e:
+        # Log the exception to the file and re-raise it so the async handler can catch it
+        logger.exception(f"Backtest for {params.ticker} failed in background thread")
+        log_history.append(f"[BOT] Backtest for {params.ticker} failed with exception: {e}")
+        raise
+    finally:
+        if file_handler:
+            log_to_file_and_history(f"--- Backtest for {params.ticker} complete ---")
+            file_handler.close()
+            run_logger.removeHandler(file_handler)
+
+
 async def backtest_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    logger.info(f"Handler /backtest invoked with args: {context.args} from chat: {update.effective_chat.id}")
+
     args = context.args
     defaults = context.bot_data["defaults"]
     log_history: Deque[str] = deque(maxlen=20)
 
-    # --- 1. Immediate ACK and Argument Parsing ---
+    # --- 1. Argument Parsing ---
     try:
         if len(args) < 3:
             await update.effective_message.reply_text(
-                "Usage: */backtest <TICKER> <YYYY-MM-DD> <DAILY_BUDGET> [prefer_avg_buy] [sell_r] [fx] [interval]*",
+                "Usage: `/backtest <TICKER> <YYYY-MM-DD> <DAILY_BUDGET> [optional_args...]`",
                 parse_mode=ParseMode.MARKDOWN
             )
             return
 
         ticker = args[0].strip().upper()
+        
         start_date_str = args[1].strip()
-        datetime.strptime(start_date_str, "%Y-%m-%d")  # Validate format
-        daily_budget = float(args[2])
+        try:
+            datetime.strptime(start_date_str, "%Y-%m-%d")
+        except ValueError:
+            await update.effective_message.reply_text(
+                f"❌ *Invalid Date Format: `{start_date_str}`*\n\nPlease use the `YYYY-MM-DD` format (e.g., `2023-01-01`)."
+            )
+            return
+
+        try:
+            daily_budget = float(args[2])
+        except ValueError:
+            await update.effective_message.reply_text(
+                f"❌ *Invalid Budget: `{args[2]}`*\n\nPlease provide a number for the daily budget (e.g., `500`)."
+            )
+            return
 
         prefer_avg_buy = _to_bool(args[3]) if len(args) > 3 else True
         sell_r = float(args[4]) if len(args) > 4 else defaults["sell_r"]
@@ -202,62 +281,33 @@ async def backtest_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
             sell_r=sell_r, fx_krw_per_usd=fx, prefer_avg_buy=prefer_avg_buy, intraday_interval=interval,
         )
 
-        ack_msg = (
-            f"✅ *Backtest accepted for {ticker}*\n\n"
-            f"Parameters:\n"
-            f"  Start Date: {start_date_str}\n"
-            f"  Daily Budget: ${daily_budget:,.2f}\n"
-            f"  Sell Target: {sell_r}\n\n"
-            "Process starting now. A summary will be sent on completion, or an error if it fails."
+    except Exception as e:
+        logger.error(f"Failed during argument parsing for /backtest: {e}")
+        await update.effective_message.reply_text(
+            f"❌ *Argument Error:*\n{e}\nPlease check your inputs and use /help for more info."
         )
-        await update.effective_message.reply_text(ack_msg, parse_mode=ParseMode.MARKDOWN)
-
-    except (ValueError, IndexError) as e:
-        await update.effective_message.reply_text(f"❌ *Argument Error:*\n{e}\nPlease check your inputs.", parse_mode=ParseMode.MARKDOWN)
         return
 
-    # --- 2. Setup File-based Logging ---
-    file_handler = None
-    run_logger = logging.getLogger(f"run_{ticker}_{time.time_ns()}")
-    run_logger.propagate = False # Prevent duplicate stdout logs
-    
+    # --- 2. Acknowledge and Run in Background ---
     try:
-        log_dir = "logs"
-        os.makedirs(log_dir, exist_ok=True)
-        # Use one log file per day
-        log_file = os.path.join(log_dir, f"{datetime.now().strftime('%Y-%m-%d')}.log")
-
-        # Append to the daily log file
-        file_handler = logging.FileHandler(log_file, mode='a')
-        file_handler.setFormatter(logging.Formatter("[%(asctime)s] [%(name)s] %(message)s"))
-        run_logger.addHandler(file_handler)
-        run_logger.setLevel(logging.INFO)
-
-        def log_to_file_and_history(msg: str):
-            run_logger.info(msg)
-            log_history.append(msg)
-
-        # --- 3. Run Backtest in Thread ---
-        log_to_file_and_history(f"--- Starting backtest for {ticker} from chat {update.effective_chat.id} ---")
-
-        result: BacktestResult = await asyncio.to_thread(
-            run_backtest,
-            params=params,
-            fetch_daily=fetch_daily,
-            fetch_intraday=fetch_intraday,
-            log=log_to_file_and_history,
+        await update.effective_message.reply_text(
+            f"✅ *Backtest accepted for {ticker}*\n\n"
+            "Process starting now. A summary will be sent on completion, or an error if it fails."
         )
 
-        log_to_file_and_history(f"[BOT] Backtest for {ticker} finished successfully.")
+        result = await asyncio.to_thread(
+            sync_backtest_runner,
+            params=params,
+            log_history=log_history,
+            chat_id=update.effective_chat.id
+        )
+        
         summary_md = _format_result_md(result)
         await update.effective_message.reply_text(summary_md, parse_mode=ParseMode.MARKDOWN)
 
     except Exception as e:
-        logger.exception(f"Backtest for {ticker} failed in background thread")
-        log_to_file_and_history(f"[BOT] Backtest for {ticker} failed with exception: {e}")
-        
         error_msg = (
-            f"❌ *Backtest for {ticker} failed:*\n{type(e).__name__}: {e}\n\n"
+            f"❌ *Backtest for {params.ticker} failed:*\n{type(e).__name__}: {e}\n\n"
             "*Last few log messages:*\n"
             "```\n"
             f"{'\n'.join(log_history)}\n"
@@ -265,13 +315,6 @@ async def backtest_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         )
         for chunk in _chunk_text(error_msg):
             await update.effective_message.reply_text(chunk, parse_mode=ParseMode.MARKDOWN)
-
-    finally:
-        # --- 4. Cleanup ---
-        if file_handler:
-            log_to_file_and_history(f"--- Backtest for {ticker} complete ---")
-            file_handler.close()
-            run_logger.removeHandler(file_handler)
 
 
 def main() -> None:
@@ -294,6 +337,9 @@ def main() -> None:
     # No longer setting allowed_chat_ids in bot_data
     app.bot_data["defaults"] = defaults
     app.bot_data["intraday_start_date"] = intraday_start_date
+
+    # --- Register handlers ---
+    app.add_error_handler(error_handler)
 
     app.add_handler(CommandHandler("start", start_cmd))
     app.add_handler(CommandHandler("help", help_cmd))
