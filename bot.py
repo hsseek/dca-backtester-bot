@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import os
 import logging
+from logging.handlers import RotatingFileHandler
 import time
 from collections import deque
 from datetime import datetime, timedelta
@@ -27,6 +28,9 @@ logging.basicConfig(
     handlers=[logging.StreamHandler()],
 )
 logger = logging.getLogger("dca-backtester-bot")
+
+MAX_LOG_SIZE_BYTES = 5 * 1024 * 1024  # 5 MB
+MAX_BACKUP_LOG_FILES = 5
 
 
 # -------------------------
@@ -173,14 +177,14 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "  /ping - Check bot status and current default settings.\n"
         "  /backtest - Run a backtest simulation.\n\n"
         "*Usage for /backtest:*\n"
-        "  */backtest <TICKER> <YYYY-MM-DD> <DAILY_BUDGET> [prefer_avg_buy] [sell_r] [fx] [interval]*\n\n"
+        "  */backtest <TICKER> <YYYY-MM-DD> <DAILY_BUDGET> [sell_r] [fx] [prefer_avg_buy] [interval]*\n\n"
         "*Arguments:*\n"
         "  *<TICKER>*: Stock ticker symbol (e.g., QQQ, SPY).\n"
         "  *<YYYY-MM-DD>*: Start date for the backtest (e.g., 2023-01-01).\n"
         "  *<DAILY_BUDGET>*: Daily budget in USD for purchases (e.g., 500).\n"
-        "  *[prefer_avg_buy]*: Optional. *true* or *false*. Default is *true*.\n"
         "  *[sell_r]*: Optional. Sell target ratio (e.g., 0.10 for 10%). Default from config.\n"
         "  *[fx]*: Optional. FX rate KRW per USD (e.g., 1450). Default from config.\n"
+        "  *[prefer_avg_buy]*: Optional. *true* or *false*. Default is *true*.\n"
         "  *[interval]*: Optional. Intraday interval (e.g., 5m, 15m). Default from config.\n\n"
         f"*Example:*\n"
         f"`/backtest TQQQ {intraday_start_date} 500`\n\n"
@@ -201,9 +205,15 @@ def sync_backtest_runner(params: BacktestParams, log_history: Deque[str], chat_i
     try:
         log_dir = "logs"
         os.makedirs(log_dir, exist_ok=True)
-        log_file = os.path.join(log_dir, f"{datetime.now().strftime('%Y-%m-%d')}.log")
+        log_file = os.path.join(log_dir, "backtest.log")
 
-        file_handler = logging.FileHandler(log_file, mode='a', encoding='utf-8')
+        file_handler = RotatingFileHandler(
+            log_file,
+            mode='a',
+            maxBytes=MAX_LOG_SIZE_BYTES,
+            backupCount=MAX_BACKUP_LOG_FILES,
+            encoding='utf-8'
+        )
         file_handler.setFormatter(logging.Formatter("[%(asctime)s] [%(name)s] %(message)s"))
         run_logger.addHandler(file_handler)
         run_logger.setLevel(logging.INFO)
@@ -271,9 +281,9 @@ async def backtest_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
             )
             return
 
-        prefer_avg_buy = _to_bool(args[3]) if len(args) > 3 else True
-        sell_r = float(args[4]) if len(args) > 4 else defaults["sell_r"]
-        fx = float(args[5]) if len(args) > 5 else defaults["fx"]
+        sell_r = float(args[3]) if len(args) > 3 else defaults["sell_r"]
+        fx = float(args[4]) if len(args) > 4 else defaults["fx"]
+        prefer_avg_buy = _to_bool(args[5]) if len(args) > 5 else True
         interval = args[6].strip() if len(args) > 6 else defaults["interval"]
 
         params = BacktestParams(
