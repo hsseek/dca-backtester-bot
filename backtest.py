@@ -211,7 +211,7 @@ def run_backtest(
             if day_high >= target:
                 sold = True
                 sell_price = target
-                sell_dt_et = f"{d.isoformat()} (intraday, interval={params.intraday_interval})"
+                sell_dt_et = f"{d.isoformat()}"
                 days_to_sell = (d - first_trade_date).days
                 proceeds = shares * sell_price
                 profit = proceeds - total_cost
