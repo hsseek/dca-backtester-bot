@@ -7,7 +7,7 @@ from logging.handlers import RotatingFileHandler
 import time
 from collections import deque
 from datetime import datetime, timedelta
-from typing import Deque, List, Optional, Set
+from typing import Deque, List
 
 import pandas as pd
 import yfinance as yf
@@ -16,7 +16,7 @@ from telegram import Update
 from telegram.constants import ParseMode
 from telegram.ext import Application, CommandHandler, ContextTypes
 
-from backtest import BacktestParams, BacktestResult, run_backtest
+from backtest import BacktestParams, BacktestSeriesResult, run_backtest
 
 # -------------------------
 # Global & App-level Logging
@@ -62,21 +62,47 @@ def _get_intraday_start_date() -> str:
 # -------------------------
 # Data fetchers (yfinance)
 # -------------------------
-def fetch_daily(ticker: str, start: str, end: str) -> pd.DataFrame:
-    df = yf.download(
-        tickers=ticker, start=start, end=end, interval="1d",
-        auto_adjust=False, actions=False, progress=False, group_by="column",
-    )
+async def fetch_daily(ticker: str, start: str, end: str, timeout: int = 60) -> pd.DataFrame:
+    """Asynchronously fetches daily data with a timeout."""
+    def _download():
+        return yf.download(
+            tickers=ticker, start=start, end=end, interval="1d",
+            auto_adjust=False, actions=False, progress=False, group_by="column",
+        )
+
+    loop = asyncio.get_running_loop()
+    try:
+        # noinspection PyTypeChecker
+        df = await asyncio.wait_for(
+            loop.run_in_executor(None, _download),
+            timeout=timeout
+        )
+    except asyncio.TimeoutError:
+        raise RuntimeError(f"yfinance daily data download for {ticker} timed out after {timeout} seconds.")
+
     if isinstance(df.columns, pd.MultiIndex):
         df.columns = [c[0] for c in df.columns]
     return df
 
 
-def fetch_intraday(ticker: str, start: str, end: str, interval: str) -> pd.DataFrame:
-    df = yf.download(
-        tickers=ticker, start=start, end=end, interval=interval,
-        auto_adjust=False, actions=False, progress=False, group_by="column", prepost=False,
-    )
+async def fetch_intraday(ticker: str, start: str, end: str, interval: str, timeout: int = 120) -> pd.DataFrame:
+    """Asynchronously fetches intraday data with a timeout."""
+    def _download():
+        return yf.download(
+            tickers=ticker, start=start, end=end, interval=interval,
+            auto_adjust=False, actions=False, progress=False, group_by="column", prepost=False,
+        )
+
+    loop = asyncio.get_running_loop()
+    try:
+        # noinspection PyTypeChecker
+        df = await asyncio.wait_for(
+            loop.run_in_executor(None, _download),
+            timeout=timeout
+        )
+    except asyncio.TimeoutError:
+        raise RuntimeError(f"yfinance intraday data download for {ticker} ({interval}) timed out after {timeout} seconds.")
+
     if isinstance(df.columns, pd.MultiIndex):
         df.columns = [c[0] for c in df.columns]
     return df
@@ -98,28 +124,61 @@ def _chunk_text(s: str, limit: int = 4000) -> List[str]:
     return chunks
 
 
-def _format_result_md(res: BacktestResult) -> str:
-    # Only return the single "not reached" line if not sold.
-    if not res.sold:
-        return "⚠️ *Sell target not reached within available history.*"
+def _format_series_result_md(series_res: BacktestSeriesResult) -> str:
+    lines = []
+    
+    # --- 1. Summary Section ---
+    total_profit_usd = sum(t.profit_usd for t in series_res.completed_trades if t.profit_usd is not None)
+    total_profit_krw = sum(t.profit_krw for t in series_res.completed_trades if t.profit_krw is not None)
+    num_trades = len(series_res.completed_trades)
 
-    profit_pct_str = ""
-    if res.profit_pct_on_cost is not None:
-        profit_pct_str = f" ({res.profit_pct_on_cost*100:.2f}%)"
+    # Use ticker from the first trade if available, otherwise from open position, or a placeholder
+    ticker = "N/A"
+    if series_res.completed_trades:
+        ticker = series_res.completed_trades[0].ticker
+    elif series_res.open_position_result:
+        ticker = series_res.open_position_result.ticker
 
-    lines = [
-        f"*Ticker:* {res.ticker}",
-        f"*First buy:* {res.first_buy_dt_et} @ ${res.first_buy_price:,.2f}",
-        f"*Final shares:* {res.final_shares}",
-        f"*Final avg cost:* ${res.final_avg_cost:,.2f}",
-        f"*Total cost:* ${res.total_cost_usd:,.2f}",
-        "",
-        "✅ *SOLD triggered*",
-        f"*Sell time:* {res.sell_dt_et} ({res.days_to_sell} days)",
-        f"*Sell price:* ${res.sell_price:,.2f}",
-        f"*Proceeds:* ${res.proceeds_usd:,.2f} (₩{res.proceeds_krw:,.0f})",
-        f"*Profit{profit_pct_str}:* ${res.profit_usd:,.2f} (₩{res.profit_krw:,.0f})",
-    ]
+    lines.append(f"*{ticker} Backtest Summary*")
+    lines.append(f"*Trades completed:* {num_trades}")
+    lines.append(f"*Total Profit:* ${total_profit_usd:,.2f} (₩{total_profit_krw:,.0f})")
+    lines.append("-" * 20)
+
+    # --- 2. Individual Trades ---
+    if not series_res.completed_trades:
+        lines.append("No sell targets were reached during the simulation period.")
+    else:
+        for i, res in enumerate(series_res.completed_trades):
+            lines.append(f"✅ *Trade #{i+1}: SOLD triggered*")
+            
+            profit_pct_str = f" ({res.profit_pct_on_cost*100:.2f}%)" if res.profit_pct_on_cost is not None else ""
+            
+            lines.extend([
+                f"  *Duration:* {res.days_to_sell} days",
+                f"  *First buy:* {res.first_buy_dt_et}",
+                f"  *Total cost:* ${res.total_cost_usd:,.2f}",
+                f"  *Sell time:* {res.sell_dt_et}",
+                f"  *Sell price:* ${res.sell_price:,.2f}",
+                f"  *Proceeds:* ${res.proceeds_usd:,.2f}",
+                f"  *Profit{profit_pct_str}:* ${res.profit_usd:,.2f} (₩{res.profit_krw:,.0f})",
+                ""]) # empty line for spacing
+
+    lines.append("-" * 20)
+    
+    # --- 3. Final Open Position ---
+    if series_res.open_position_result:
+        res = series_res.open_position_result
+        lines.append("💼 *Final Unsold Position*")
+        lines.extend([
+            f"  *Ticker:* {res.ticker}",
+            f"  *First buy:* {res.first_buy_dt_et} @ ${res.first_buy_price:,.2f}",
+            f"  *Final shares:* {res.final_shares}",
+            f"  *Final avg cost:* ${res.final_avg_cost:,.2f}",
+            f"  *Total cost:* ${res.total_cost_usd:,.2f}",
+        ])
+    else:
+        lines.append("No open position at the end of the simulation.")
+        
     return "\n".join(lines)
 
 
@@ -139,13 +198,11 @@ async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> N
 
 async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     # Use the intraday_start_date from bot_data
-    intraday_start_date = context.bot_data.get("intraday_start_date", "YYYY-MM-DD")
     msg = (
         "DCA Backtester Bot is running.\n\n"
         "Use /ping to check status and defaults.\n"
-        "Use /backtest to run a simulation.\n\n"
-        "*Example:*\n"
-        f"`/backtest TQQQ {intraday_start_date} 500`"
+        "Use /bt to run a simulation.\n\n"
+        f"`/bt TQQQ`"
     )
     await update.effective_message.reply_text(msg, parse_mode=ParseMode.MARKDOWN)
 
@@ -162,6 +219,7 @@ async def ping_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         f"  Sell Ratio = {defaults['sell_r']}",
         f"  FX Rate = {defaults['fx']}",
         f"  Intraday Interval = {defaults['interval']}",
+        f"  Daily Budget = {defaults['daily_budget']}",
     ]
     await update.effective_message.reply_text("\n".join(lines), parse_mode=ParseMode.MARKDOWN)
 
@@ -175,33 +233,35 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "  /start - Get a welcome message and basic bot information.\n"
         "  /help - Display this help message.\n"
         "  /ping - Check bot status and current default settings.\n"
-        "  /backtest - Run a backtest simulation.\n\n"
-        "*Usage for /backtest:*\n"
-        "  */backtest <TICKER> <YYYY-MM-DD> <DAILY_BUDGET> [sell_r] [fx] [prefer_avg_buy] [interval]*\n\n"
+        "  /bt - Run a backtest simulation.\n\n"
+        "*Usage for /bt:*\n"
+        "  */bt <TICKER> [YYYY-MM-DD] [DAILY_BUDGET] [sell_r] [fx] [prefer_avg_buy] [interval]*\n\n"
         "*Arguments:*\n"
-        "  *<TICKER>*: Stock ticker symbol (e.g., QQQ, SPY).\n"
-        "  *<YYYY-MM-DD>*: Start date for the backtest (e.g., 2023-01-01).\n"
-        "  *<DAILY_BUDGET>*: Daily budget in USD for purchases (e.g., 500).\n"
+        "  *<TICKER>*: Required. Stock ticker symbol (e.g., QQQ, SPY).\n"
+        "  *[YYYY-MM-DD]*: Optional. Start date for the backtest. Defaults to the oldest available date for the chosen interval.\n"
+        "  *[DAILY_BUDGET]*: Optional. Daily budget in USD. Defaults to the value in config.\n"
         "  *[sell_r]*: Optional. Sell target ratio (e.g., 0.10 for 10%). Default from config.\n"
         "  *[fx]*: Optional. FX rate KRW per USD (e.g., 1450). Default from config.\n"
         "  *[prefer_avg_buy]*: Optional. *true* or *false*. Default is *true*.\n"
         "  *[interval]*: Optional. Intraday interval (e.g., 5m, 15m). Default from config.\n\n"
-        f"*Example:*\n"
-        f"`/backtest TQQQ {intraday_start_date} 500`\n\n"
+        f"*Example (all optional args):*\n"
+        f"`/bt TQQQ {intraday_start_date} 500 0.10 1450 true 5m`\n\n"
+        f"*Example (ticker only):*\n"
+        f"`/bt TQQQ`\n\n"
     )
     await update.effective_message.reply_text(help_message, parse_mode=ParseMode.MARKDOWN)
 
 
-def sync_backtest_runner(params: BacktestParams, log_history: Deque[str], chat_id: int) -> BacktestResult:
+async def async_backtest_runner(params: BacktestParams, log_history: Deque[str], chat_id: int) -> BacktestSeriesResult:
     """
-    Synchronous helper to run the backtest and handle file logging.
-    This function is intended to be run in a separate thread.
+    Asynchronous helper to run the backtest and handle file logging.
     """
     file_handler = None
     # Use a unique logger name for each run to ensure thread safety with handlers
     run_logger = logging.getLogger(f"run_{params.ticker}_{time.time_ns()}")
     run_logger.propagate = False  # Prevent duplicate logs to stdout
 
+    log_to_file_and_history = None
     try:
         log_dir = "logs"
         os.makedirs(log_dir, exist_ok=True)
@@ -218,13 +278,15 @@ def sync_backtest_runner(params: BacktestParams, log_history: Deque[str], chat_i
         run_logger.addHandler(file_handler)
         run_logger.setLevel(logging.INFO)
 
-        def log_to_file_and_history(msg: str):
+        def _log_to_file_and_history(msg: str):
             run_logger.info(msg)
             log_history.append(msg)
+        
+        log_to_file_and_history = _log_to_file_and_history
 
         log_to_file_and_history(f"--- Starting backtest for {params.ticker} from chat {chat_id} ---")
 
-        result = run_backtest(
+        result = await run_backtest(
             params=params,
             fetch_daily=fetch_daily,
             fetch_intraday=fetch_intraday,
@@ -236,48 +298,49 @@ def sync_backtest_runner(params: BacktestParams, log_history: Deque[str], chat_i
 
     except Exception as e:
         # Log the exception to the file and re-raise it so the async handler can catch it
-        logger.exception(f"Backtest for {params.ticker} failed in background thread")
+        logger.exception(f"Backtest for {params.ticker} failed in background task")
         log_history.append(f"[BOT] Backtest for {params.ticker} failed with exception: {e}")
         raise
     finally:
-        if file_handler:
+        if file_handler and log_to_file_and_history:
             log_to_file_and_history(f"--- Backtest for {params.ticker} complete ---")
             file_handler.close()
             run_logger.removeHandler(file_handler)
 
 
 async def backtest_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    logger.info(f"Handler /backtest invoked with args: {context.args} from chat: {update.effective_chat.id}")
+    logger.info(f"Handler /bt invoked with args: {context.args} from chat: {update.effective_chat.id}")
 
-    args = context.args
+    args: List[str] = context.args
     defaults = context.bot_data["defaults"]
     log_history: Deque[str] = deque(maxlen=20)
 
     # --- 1. Argument Parsing ---
     try:
-        if len(args) < 3:
+        if not args:
             await update.effective_message.reply_text(
-                "Usage: `/backtest <TICKER> <YYYY-MM-DD> <DAILY_BUDGET> [optional_args...]`",
+                "Usage: `/bt <TICKER> [YYYY-MM-DD] [DAILY_BUDGET] [optional_args...]`",
                 parse_mode=ParseMode.MARKDOWN
             )
             return
 
         ticker = args[0].strip().upper()
         
-        start_date_str = args[1].strip()
-        try:
-            datetime.strptime(start_date_str, "%Y-%m-%d")
-        except ValueError:
-            await update.effective_message.reply_text(
-                f"❌ *Invalid Date Format: `{start_date_str}`*\n\nPlease use the `YYYY-MM-DD` format (e.g., `2023-01-01`)."
-            )
-            return
+        start_date_str = args[1].strip() if len(args) > 1 else context.bot_data.get("intraday_start_date")
+        if start_date_str:
+            try:
+                datetime.strptime(start_date_str, "%Y-%m-%d")
+            except ValueError:
+                await update.effective_message.reply_text(
+                    f"❌ *Invalid Date Format: `{start_date_str}`*\n\nPlease use the `YYYY-MM-DD` format (e.g., `2023-01-01`)."
+                )
+                return
 
         try:
-            daily_budget = float(args[2])
-        except ValueError:
+            daily_budget = float(args[2]) if len(args) > 2 else defaults["daily_budget"]
+        except (ValueError, IndexError):
             await update.effective_message.reply_text(
-                f"❌ *Invalid Budget: `{args[2]}`*\n\nPlease provide a number for the daily budget (e.g., `500`)."
+                f"❌ *Invalid Budget: `{args[2] if len(args) > 2 else ''}`*\n\nPlease provide a number for the daily budget (e.g., `500`)."
             )
             return
 
@@ -292,7 +355,7 @@ async def backtest_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         )
 
     except Exception as e:
-        logger.error(f"Failed during argument parsing for /backtest: {e}")
+        logger.error(f"Failed during argument parsing for /bt: {e}")
         await update.effective_message.reply_text(
             f"❌ *Argument Error:*\n{e}\nPlease check your inputs and use /help for more info."
         )
@@ -301,19 +364,35 @@ async def backtest_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     # --- 2. Acknowledge and Run in Background ---
     try:
         await update.effective_message.reply_text(
-            f"✅ *Backtest accepted for {ticker}*\n\n"
+            f"✅ Backtest accepted for {ticker}\n"
             "Process starting now. A summary will be sent on completion, or an error if it fails."
         )
 
-        result = await asyncio.to_thread(
-            sync_backtest_runner,
-            params=params,
-            log_history=log_history,
-            chat_id=update.effective_chat.id
+        # The whole backtest (including data fetching) should not take more than a few minutes.
+        # Let's set a generous timeout of 5 minutes.
+        result = await asyncio.wait_for(
+            async_backtest_runner(
+                params=params,
+                log_history=log_history,
+                chat_id=update.effective_chat.id
+            ),
+            timeout=300.0
         )
         
-        summary_md = _format_result_md(result)
+        summary_md = _format_series_result_md(result)
         await update.effective_message.reply_text(summary_md, parse_mode=ParseMode.MARKDOWN)
+
+    except asyncio.TimeoutError:
+        error_msg = (
+            f"❌ *Backtest for {params.ticker} timed out after 5 minutes.*\n\n"
+            "This could be due to slow data downloads or a very long simulation period.\n\n"
+            "*Last few log messages:*\n"
+            "```\n"
+            f"{'\n'.join(log_history)}\n"
+            "```"
+        )
+        for chunk in _chunk_text(error_msg):
+            await update.effective_message.reply_text(chunk, parse_mode=ParseMode.MARKDOWN)
 
     except Exception as e:
         error_msg = (
@@ -337,6 +416,7 @@ def main() -> None:
         "fx": float(os.getenv("DEFAULT_FX", "1450.0")),
         "sell_r": float(os.getenv("DEFAULT_SELL_R", "0.10")),
         "interval": os.getenv("DEFAULT_INTRADAY_INTERVAL", "5m"),
+        "daily_budget": float(os.getenv("DEFAULT_DAILY_BUDGET", "500.0")),
     }
 
     # Fetch oldest date for help message and store in bot_data
@@ -354,10 +434,10 @@ def main() -> None:
     app.add_handler(CommandHandler("start", start_cmd))
     app.add_handler(CommandHandler("help", help_cmd))
     app.add_handler(CommandHandler("ping", ping_cmd))
-    app.add_handler(CommandHandler("backtest", backtest_cmd))
+    app.add_handler(CommandHandler("bt", backtest_cmd))
 
     logger.info("Bot started and handlers are registered. Starting polling...")
-    app.run_polling()
+    app.run_polling(drop_pending_updates=True)
     logger.info("Bot stopped.")
 
 

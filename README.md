@@ -48,15 +48,15 @@ A Python-based Telegram bot that runs a dollar-cost averaging (DCA) backtest usi
     -   `/start`: Get a welcome message.
     -   `/help`: Display a detailed help message with all commands and arguments.
     -   `/ping`: Check if the bot is online and view its current default settings.
-    -   `/backtest`: Run a simulation.
+    -   `/bt`: Run a backtest simulation.
 
     **Backtest Command Usage:**
     ```
-    /backtest <TICKER> <YYYY-MM-DD> <DAILY_BUDGET> [prefer_avg_buy] [sell_r] [fx] [interval]
+    /bt <TICKER> <YYYY-MM-DD> <DAILY_BUDGET> [prefer_avg_buy] [sell_r] [fx] [interval]
     ```
     -   `<TICKER>`: Stock ticker symbol (e.g., QQQ, SPY).
-    -   `<YYYY-MM-DD>`: Start date for the backtest.
-    -   `<DAILY_BUDGET>`: Daily budget in USD for purchases.
+    -   `[YYYY-MM-DD]`: (Optional) Start date for the backtest. Defaults to the oldest day data available.
+    -   `[DAILY_BUDGET]`: (Optional) Daily budget in USD for purchases.
     -   `[prefer_avg_buy]`: (Optional) `true` or `false`. Defaults to `true`.
     -   `[sell_r]`: (Optional) Sell target ratio.
     -   `[fx]`: (Optional) FX rate for currency conversion.
@@ -64,7 +64,7 @@ A Python-based Telegram bot that runs a dollar-cost averaging (DCA) backtest usi
 
     **Example:**
     ```
-    /backtest TQQQ 2023-01-01 500
+    /bt TQQQ 2023-01-01 500
     ```
 
 ## Configuration
