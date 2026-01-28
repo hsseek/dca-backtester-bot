@@ -1,0 +1,1 @@
+When running `python`, use `/home/sun/PythonProjects/dca-backtester-bot/.venv` to activate the virtual environment. Ensure the environment is sourced before executing Python scripts to manage dependencies and project-specific configurations effectively. This ensures consistent execution and isolates project requirements.

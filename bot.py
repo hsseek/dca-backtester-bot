@@ -1,12 +1,15 @@
 from __future__ import annotations
 
 import asyncio
-import os
+import html
+import json
 import logging
-from logging.handlers import RotatingFileHandler
+import os
 import time
+import traceback
 from collections import deque
 from datetime import datetime, timedelta
+from logging.handlers import RotatingFileHandler
 from typing import Deque, List
 
 import pandas as pd
@@ -169,12 +172,21 @@ def _format_series_result_md(series_res: BacktestSeriesResult) -> str:
     if series_res.open_position_result:
         res = series_res.open_position_result
         lines.append("💼 *Final Unsold Position*")
+        
+        unrealized_pl = 0.0
+        unrealized_pl_rate = 0.0
+        if series_res.last_day_close_price is not None:
+            unrealized_pl = (series_res.last_day_close_price - res.final_avg_cost) * res.final_shares
+            if res.final_avg_cost > 0:
+                unrealized_pl_rate = (series_res.last_day_close_price - res.final_avg_cost) / res.final_avg_cost
+        
         lines.extend([
             f"  *Ticker:* {res.ticker}",
             f"  *First buy:* {res.first_buy_dt_et} @ ${res.first_buy_price:,.2f}",
             f"  *Final shares:* {res.final_shares}",
             f"  *Final avg cost:* ${res.final_avg_cost:,.2f}",
             f"  *Total cost:* ${res.total_cost_usd:,.2f}",
+            f"  *Unrealized P/L:* ${-unrealized_pl:,.2f} ({-unrealized_pl_rate:.2%})",
         ])
     else:
         lines.append("No open position at the end of the simulation.")
@@ -186,14 +198,32 @@ def _format_series_result_md(series_res: BacktestSeriesResult) -> str:
 # Command & Error handlers
 # -------------------------
 async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Log the error and send a telegram message to notify the user."""
+    """Log the error and send a telegram message to notify the user and admin."""
     logger.error("Exception while handling an update:", exc_info=context.error)
 
     # Optionally, notify the user that an error occurred
     if isinstance(update, Update) and update.effective_message:
-        await update.effective_message.reply_text(
-            "An unexpected error occurred. The developer has been notified."
+        await update.effective_message.reply_text("An unexpected error occurred. The developer has been notified.")
+
+    # Send a detailed error report to the admin
+    admin_user_id = context.bot_data.get("admin_user_id")
+    if admin_user_id and context.error:
+        tb_list = traceback.format_exception(None, context.error, context.error.__traceback__)
+        tb_string = "".join(tb_list)
+        
+        # Format the message
+        update_str = json.dumps(update.to_dict(), indent=2) if isinstance(update, Update) else str(update)
+        message = (
+            f"An exception was raised while handling an update\n"
+            f"<pre>update = {html.escape(update_str)}</pre>\n\n"
+            f"<pre>context.chat_data = {html.escape(str(context.chat_data))}</pre>\n\n"
+            f"<pre>context.user_data = {html.escape(str(context.user_data))}</pre>\n\n"
+            f"<pre>{html.escape(tb_string)}</pre>"
         )
+        
+        # Split the message into chunks to avoid hitting Telegram's message length limit
+        for chunk in _chunk_text(message, limit=4096):
+            await context.bot.send_message(chat_id=admin_user_id, text=chunk, parse_mode=ParseMode.HTML)
 
 
 async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -419,7 +449,7 @@ def main() -> None:
         "daily_budget": float(os.getenv("DEFAULT_DAILY_BUDGET", "500.0")),
     }
 
-    # Fetch oldest date for help message and store in bot_data
+    # Fetch the oldest date for help message and store in bot_data
     intraday_start_date = _get_intraday_start_date()
     logger.info(f"Calculated recommended intraday start date: {intraday_start_date}")
 
@@ -427,6 +457,7 @@ def main() -> None:
     # No longer setting allowed_chat_ids in bot_data
     app.bot_data["defaults"] = defaults
     app.bot_data["intraday_start_date"] = intraday_start_date
+    app.bot_data["admin_user_id"] = os.getenv("ADMIN_USER_ID")
 
     # --- Register handlers ---
     app.add_error_handler(error_handler)

@@ -71,6 +71,47 @@ class BacktestSeriesResult:
     start_date: date
     end_date: date
     daily_budget_usd: float
+    last_day_close_price: Optional[float]
+
+
+async def _find_next_available_intraday_start(
+    start_date: date,
+    fetch_intraday: Callable[[str, str, str, str], Coroutine[Any, Any, pd.DataFrame]],
+    log: Callable[[str], None],
+    probe_ticker: str = "MSFT",
+    interval: str = "5m"
+) -> date:
+    et = pytz.timezone("America/New_York")
+    
+    days_ago_60 = date.today() - timedelta(days=60)
+    
+    current_date = start_date
+    if start_date < days_ago_60:
+        log(f"[DATA] Start date is older than 60 days. Trying to find a recent valid trading day, starting from {days_ago_60}.")
+        current_date = days_ago_60
+    else:
+        log(f"[DATA] Start date is within 60 days. Trying to find a valid trading day, starting from the day after {start_date}.")
+        current_date += timedelta(days=1)
+
+    for i in range(365): # Limit to 1 year of searching
+        log(f"[DATA] Probing for intraday data on {current_date.isoformat()} with {probe_ticker}...")
+        
+        intraday_start = current_date.strftime("%Y-%m-%d")
+        intraday_end = (current_date + timedelta(days=1)).strftime("%Y-%m-%d")
+        
+        try:
+            probe_data = await fetch_intraday(probe_ticker, intraday_start, intraday_end, interval)
+            if not probe_data.empty:
+                log(f"[DATA] Found available intraday data on {current_date.isoformat()}.")
+                return current_date
+        except Exception as e:
+            log(f"[DATA] Error probing for data on {current_date.isoformat()}: {e}")
+
+        current_date += timedelta(days=1)
+        if current_date > date.today() + timedelta(days=1):
+             raise RuntimeError("Could not find any recent trading day with intraday data.")
+
+    raise RuntimeError("Could not find a valid trading day with intraday data within a year.")
 
 
 async def run_backtest(
@@ -122,7 +163,39 @@ async def run_backtest(
     _log(f"[DATA] Downloading intraday data ({params.intraday_interval}) for {ticker}...")
     intra = await fetch_intraday(ticker, intraday_start, intraday_end, params.intraday_interval)
     if intra.empty:
-        raise RuntimeError("No intraday data. Try a more recent start date or a coarser interval.")
+        _log(f"[DATA] No intraday data found for {ticker} on {intraday_start}. Searching for the next available day...")
+        new_start_date = await _find_next_available_intraday_start(
+            start_date=_parse_yyyy_mm_dd(intraday_start),
+            fetch_intraday=fetch_intraday,
+            log=_log,
+            interval=params.intraday_interval
+        )
+        
+        # We need to re-fetch daily data as well to ensure we have the correct data for the new start date
+        start_d = new_start_date
+        daily_start = (start_d - timedelta(days=7)).strftime("%Y-%m-%d")
+        daily_end = (date.today() + timedelta(days=1)).strftime("%Y-%m-%d")
+
+        _log(f"[DATA] Re-downloading daily data for {ticker} from {daily_start}...")
+        daily = await fetch_daily(ticker, daily_start, daily_end)
+        if daily.empty:
+            raise RuntimeError("No daily data after finding a valid intraday start date.")
+        
+        daily = daily.copy()
+        daily["__date"] = pd.to_datetime(daily.index).date
+        daily = daily.sort_values("__date")
+        
+        sim_daily = daily[daily["__date"] >= start_d].copy()
+        if sim_daily.empty:
+            raise RuntimeError("No trading days found after the adjusted start date.")
+
+        intraday_start = sim_daily.iloc[0]["__date"].strftime("%Y-%m-%d")
+        intraday_end = (sim_daily.iloc[-1]["__date"] + timedelta(days=1)).strftime("%Y-%m-%d")
+        
+        _log(f"[DATA] Re-downloading intraday data ({params.intraday_interval}) for {ticker} from {intraday_start}...")
+        intra = await fetch_intraday(ticker, intraday_start, intraday_end, params.intraday_interval)
+        if intra.empty:
+            raise RuntimeError(f"Still no intraday data for {ticker} even after finding a valid trading day.")
 
     intra = intra.copy()
     intra.index = pd.to_datetime(intra.index).tz_convert(et)
@@ -211,10 +284,13 @@ async def run_backtest(
             profit_usd=None, profit_pct_on_cost=None, proceeds_krw=None, profit_krw=None, logs=[]
         )
     
+    last_day_close_price = float(sim_daily.iloc[-1]["Close"]) if not sim_daily.empty else None
+
     return BacktestSeriesResult(
         completed_trades=completed_trades,
         open_position_result=open_pos,
         start_date=start_d,
         end_date=sim_daily.iloc[-1]["__date"],
-        daily_budget_usd=params.daily_budget_usd
+        daily_budget_usd=params.daily_budget_usd,
+        last_day_close_price=last_day_close_price
     )
