@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import atexit
+import fcntl
 import asyncio
 import html
 import json
@@ -9,6 +11,8 @@ import time
 import traceback
 from collections import deque
 from datetime import datetime, timedelta
+from zoneinfo import ZoneInfo
+import pytz
 from logging.handlers import RotatingFileHandler
 from typing import Deque, List
 
@@ -34,6 +38,8 @@ logger = logging.getLogger("dca-backtester-bot")
 
 MAX_LOG_SIZE_BYTES = 5 * 1024 * 1024  # 5 MB
 MAX_BACKUP_LOG_FILES = 5
+
+LOCK_FILE = "logs/bot.lock"
 
 
 # -------------------------
@@ -436,7 +442,255 @@ async def backtest_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
             await update.effective_message.reply_text(chunk, parse_mode=ParseMode.MARKDOWN)
 
 
+
+US_MARKET_TZ = ZoneInfo("America/New_York")
+PRE_MARKET_START_HOUR_ET = 4  # 4:00 AM ET
+AFTER_MARKET_END_HOUR_ET = 20  # 8:00 PM ET
+
+_last_alert_times: dict[str, datetime] = {}
+async def monitor_prices(application: Application) -> None:
+    bot_data = application.bot_data
+    monitored_tickers = bot_data.get("monitored_tickers", [])
+    monitoring_interval_seconds = bot_data.get("monitoring_interval_seconds", 3600)
+    admin_user_id = bot_data.get("admin_user_id")
+
+    if not monitored_tickers:
+        logger.info("No tickers configured for monitoring. Monitoring task will not start.")
+        return
+
+    logger.info(f"Starting price monitoring for {len(monitored_tickers)} tickers "
+                f"every {monitoring_interval_seconds} seconds.")
+
+    while True:
+        now_et = datetime.now(US_MARKET_TZ)
+        current_hour_et = now_et.hour
+
+        # Check if within US trading hours (4 AM ET to 8 PM ET)
+        if PRE_MARKET_START_HOUR_ET <= current_hour_et < AFTER_MARKET_END_HOUR_ET:
+            logger.info("Running scheduled price monitoring check within US trading hours.")
+            for ticker, threshold_days in monitored_tickers:
+                try:
+                    # Calculate start date for historical data
+                    # Fetch enough data to ensure we get 'threshold_days' *trading days*.
+                    # A buffer of +5 days is added to account for weekends/holidays.
+                    end_date = now_et.date()
+                    start_date = end_date - timedelta(days=threshold_days + 10) # Increased buffer
+
+                    df = await fetch_daily(ticker, start_date.strftime("%Y-%m-%d"), end_date.strftime("%Y-%m-%d"))
+
+                    if df.empty:
+                        logger.warning(f"No data fetched for {ticker} for monitoring. Skipping.")
+                        continue
+
+                    # Ensure we have enough data points: at least threshold_days + 1 for comparison
+                    # (threshold_days for historical range + 1 for current price)
+                    if len(df) < threshold_days + 1:
+                        logger.info(f"Not enough total trading days data ({len(df)}) for {ticker}. Need at least {threshold_days + 1}. Skipping.")
+                        continue
+
+                    # The most recent close is our 'current_price'
+                    current_price = df["Close"].iloc[-1]
+                    current_price_date = df.index[-1].date()
+
+                    # The historical data for comparison is the 'threshold_days' trading days *before* the current_price_date
+                    historical_df_for_comparison = df.iloc[-(threshold_days + 1):-1]
+                    
+                    # This should always have 'threshold_days' entries if len(df) was sufficient
+                    if len(historical_df_for_comparison) < threshold_days:
+                         logger.warning(f"Unexpected: historical_df_for_comparison has only {len(historical_df_for_comparison)} entries, expected {threshold_days}. Skipping.")
+                         continue
+
+                    min_price_series = historical_df_for_comparison["Close"]
+                    lowest_historical_price = min_price_series.min()
+                    lowest_historical_price_date = min_price_series.idxmin().date()
+
+
+                    # Check if current price is the lowest in the historical period
+                    if current_price < lowest_historical_price:
+                        # Implement a cool-down to prevent spamming
+                        last_alert_time = _last_alert_times.get(ticker)
+                        if not last_alert_time or (datetime.now() - last_alert_time) > timedelta(hours=24): # 24-hour cooldown
+                            message = f"🔔 *Buy now!* 🔔\n" \
+                                      f"*{ticker}* is at its lowest price in the last *{threshold_days} trading days*!\n" \
+                                      f"Current Price: *${current_price:,.2f}* (as of {current_price_date})\n" \
+                                      f"Lowest {threshold_days}-day historical trading price: *${lowest_historical_price:,.2f}* (on {lowest_historical_price_date})"
+                            if admin_user_id:
+                                try:
+                                    await application.bot.send_message(chat_id=admin_user_id, text=message, parse_mode=ParseMode.MARKDOWN)
+                                    logger.info(f"Sent 'Buy now!' alert for {ticker} to admin {admin_user_id}.")
+                                    _last_alert_times[ticker] = datetime.now()
+                                except Exception as e:
+                                    logger.error(f"Failed to send 'Buy now!' alert for {ticker} to admin {admin_user_id}: {e}")
+                            else:
+                                logger.warning(f"Admin user ID not configured. Could not send 'Buy now!' alert for {ticker}.")
+                    else:
+                        logger.info(f"{ticker} (Current: ${current_price:,.2f}) not at {threshold_days}-day trading low (Lowest: ${lowest_historical_price:,.2f} on {lowest_historical_price_date}).")
+
+                except Exception as e:
+                    logger.error(f"Error during price monitoring for {ticker}: {e}", exc_info=True)
+                    if admin_user_id:
+                        error_message = (
+                            f"❌ *Price Monitoring Error for {ticker}:*\n"
+                            f"An unexpected error occurred: `{type(e).__name__}: {e}`\n"
+                            f"Please check bot logs for details."
+                        )
+                        try:
+                            await application.bot.send_message(chat_id=admin_user_id, text=error_message, parse_mode=ParseMode.MARKDOWN)
+                        except Exception as send_e:
+                            logger.error(f"Failed to send error notification to admin {admin_user_id}: {send_e}")
+            
+            # Sleep for the configured interval if within trading hours
+            await asyncio.sleep(monitoring_interval_seconds)
+
+        else:
+            # Outside trading hours, calculate sleep until next 4 AM ET
+            logger.info("Outside US trading hours. Sleeping until next trading window.")
+            next_4am_et = now_et.replace(hour=PRE_MARKET_START_HOUR_ET, minute=0, second=0, microsecond=0)
+            if now_et.hour >= AFTER_MARKET_END_HOUR_ET:  # If past 8 PM ET, sleep until 4 AM next day
+                next_4am_et += timedelta(days=1)
+            
+            sleep_duration = (next_4am_et - now_et).total_seconds()
+            if sleep_duration < 0: # Should not happen if logic is correct, but defensive
+                sleep_duration = 0
+            logger.info(f"Sleeping for {sleep_duration:.0f} seconds until {next_4am_et.strftime('%Y-%m-%d %H:%M:%S %Z%z')}")
+            await asyncio.sleep(sleep_duration)
+
+async def daily_report_task(application: Application) -> None:
+    bot_data = application.bot_data
+    admin_user_id = bot_data.get("admin_user_id")
+    monitored_tickers = bot_data.get("monitored_tickers", [])
+
+    if not admin_user_id:
+        logger.warning("Admin user ID not configured. Daily report task will not start.")
+        return
+
+    logger.info("Starting daily report task.")
+
+    while True:
+        now_et = datetime.now(US_MARKET_TZ)
+        # Target time is 9:30 AM ET
+        target_time = now_et.replace(hour=9, minute=30, second=0, microsecond=0)
+        
+        if now_et >= target_time:
+            target_time += timedelta(days=1)
+            
+        sleep_seconds = (target_time - now_et).total_seconds()
+        logger.info(f"Daily report task sleeping for {sleep_seconds:.0f} seconds until {target_time}.")
+        await asyncio.sleep(sleep_seconds)
+        
+        # Now it's 9:30 AM ET
+        logger.info("Executing daily report.")
+        
+        # Check if it's a trading day using SPY as a proxy if no tickers are monitored
+        check_ticker = monitored_tickers[0][0] if monitored_tickers else "SPY"
+        
+        try:
+            today_str = datetime.now(US_MARKET_TZ).strftime("%Y-%m-%d")
+            # Wait a few seconds to ensure data is likely available on yfinance
+            await asyncio.sleep(30)
+            
+            # Fetch data for today to check if market is open
+            df_today = await fetch_daily(check_ticker, today_str, (datetime.now(US_MARKET_TZ) + timedelta(days=1)).strftime("%Y-%m-%d"))
+            
+            if df_today.empty or "Open" not in df_today.columns or pd.isna(df_today["Open"].iloc[-1]):
+                # Non-trading day
+                await application.bot.send_message(
+                    chat_id=admin_user_id,
+                    text=f"📅 *{today_str}* is a non-trading day.",
+                    parse_mode=ParseMode.MARKDOWN
+                )
+            else:
+                # Trading day
+                if not monitored_tickers:
+                    await application.bot.send_message(
+                        chat_id=admin_user_id,
+                        text=f"📊 *Daily Report - {today_str}*\nNo tickers configured for monitoring.",
+                        parse_mode=ParseMode.MARKDOWN
+                    )
+                else:
+                    report_lines = [f"📊 *Daily Report - {today_str}*"]
+                    for ticker, threshold_days in monitored_tickers:
+                        try:
+                            # Fetch historical data including today
+                            end_date = datetime.now(US_MARKET_TZ).date()
+                            start_date = end_date - timedelta(days=threshold_days + 15)
+                            
+                            df = await fetch_daily(ticker, start_date.strftime("%Y-%m-%d"), (end_date + timedelta(days=1)).strftime("%Y-%m-%d"))
+                            
+                            if df.empty or len(df) < 2:
+                                report_lines.append(f"\n*{ticker}*: Insufficient data.")
+                                continue
+                                
+                            # The last row is today
+                            today_open = df["Open"].iloc[-1]
+                            # Historical is everything BEFORE today
+                            historical_df = df.iloc[:-1].tail(threshold_days)
+                            
+                            if len(historical_df) == 0:
+                                report_lines.append(f"\n*{ticker}*: No historical data for comparison.")
+                                continue
+
+                            lowest_hist = historical_df["Close"].min()
+                            diff_pct = (today_open - lowest_hist) / lowest_hist
+                            
+                            status_emoji = "🟢" if today_open > lowest_hist else "🔴"
+                            
+                            report_lines.append(
+                                f"\n*{ticker}* ({threshold_days} trading days)"
+                                f"\n  Open: *${today_open:,.2f}*"
+                                f"\n  Lowest Hist Close: *${lowest_hist:,.2f}*"
+                                f"\n  Diff: *{diff_pct:+.2%}* {status_emoji}"
+                            )
+                        except Exception as ticker_e:
+                            logger.error(f"Error generating report for {ticker}: {ticker_e}")
+                            report_lines.append(f"\n*{ticker}*: Error fetching data.")
+                    
+                    await application.bot.send_message(
+                        chat_id=admin_user_id,
+                        text="\n".join(report_lines),
+                        parse_mode=ParseMode.MARKDOWN
+                    )
+                
+        except Exception as e:
+            logger.error(f"Error in daily report task: {e}", exc_info=True)
+            try:
+                await application.bot.send_message(
+                    chat_id=admin_user_id,
+                    text=f"❌ *Daily Report Error:*\n`{type(e).__name__}: {e}`"
+                )
+            except:
+                pass
+
+# File lock mechanism
+_lock_fd = None
+
+def acquire_lock() -> None:
+    global _lock_fd
+    try:
+        os.makedirs(os.path.dirname(LOCK_FILE), exist_ok=True)
+        _lock_fd = open(LOCK_FILE, "w")
+        fcntl.flock(_lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        logger.info(f"Acquired lock file: {LOCK_FILE}")
+    except BlockingIOError:
+        logger.error(f"Another instance of the bot is already running. Could not acquire lock file: {LOCK_FILE}")
+        # Optionally, clean up lock file if it's stale, but for now, just exit.
+        exit(1)
+    except Exception as e:
+        logger.exception(f"Failed to acquire lock file: {LOCK_FILE}")
+        exit(1)
+
+def release_lock() -> None:
+    global _lock_fd
+    if _lock_fd:
+        fcntl.flock(_lock_fd, fcntl.LOCK_UN)
+        _lock_fd.close()
+        logger.info(f"Released lock file: {LOCK_FILE}")
+        if os.exists(LOCK_FILE):
+            os.remove(LOCK_FILE)
+
 def main() -> None:
+    acquire_lock()
+    atexit.register(release_lock)
     load_dotenv()
     logger.info("Env vars loaded from .env")
 
@@ -454,10 +708,51 @@ def main() -> None:
     logger.info(f"Calculated recommended intraday start date: {intraday_start_date}")
 
     app = Application.builder().token(token).build()
+
+    async def post_init(application: Application) -> None:
+        if application.bot_data.get("monitored_tickers"):
+            logger.info("Scheduling price monitoring task.")
+            asyncio.create_task(monitor_prices(application))
+        else:
+            logger.info("No tickers configured for monitoring, price monitoring task will not be scheduled.")
+            
+        if application.bot_data.get("daily_report_enabled"):
+            logger.info("Scheduling daily report task.")
+            asyncio.create_task(daily_report_task(application))
+
+    app.post_init = post_init
+
     # No longer setting allowed_chat_ids in bot_data
     app.bot_data["defaults"] = defaults
     app.bot_data["intraday_start_date"] = intraday_start_date
     app.bot_data["admin_user_id"] = os.getenv("ADMIN_USER_ID")
+    app.bot_data["daily_report_enabled"] = _to_bool(os.getenv("DAILY_REPORT_ENABLED", "false"))
+
+    # Monitoring feature configuration
+    monitored_tickers_str = os.getenv("TICKERS_MONITORED", "")
+    monitored_tickers: List[tuple[str, int]] = []
+    if monitored_tickers_str:
+        for entry in monitored_tickers_str.split(","):
+            try:
+                ticker, threshold_days_str = entry.strip().split(":")
+                threshold_days = int(threshold_days_str)
+                if threshold_days <= 0:
+                    raise ValueError("Threshold days must be positive.")
+                monitored_tickers.append((ticker.upper(), threshold_days))
+            except ValueError as e:
+                logger.warning(f"Invalid TICKERS_MONITORED entry '{entry}': {e}. Skipping.")
+    app.bot_data["monitored_tickers"] = monitored_tickers
+
+    monitoring_interval_seconds = int(os.getenv("MONITORING_INTERVAL_SECONDS", "3600"))
+    if monitoring_interval_seconds <= 0:
+        logger.warning("MONITORING_INTERVAL_SECONDS must be positive. Defaulting to 3600.")
+        monitoring_interval_seconds = 3600
+    app.bot_data["monitoring_interval_seconds"] = monitoring_interval_seconds
+
+    if monitored_tickers:
+        logger.info(f"Monitoring enabled for: {monitored_tickers} every {monitoring_interval_seconds} seconds.")
+    else:
+        logger.info("No tickers configured for monitoring.")
 
     # --- Register handlers ---
     app.add_error_handler(error_handler)
